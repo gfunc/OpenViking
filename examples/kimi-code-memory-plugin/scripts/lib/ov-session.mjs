@@ -21,6 +21,7 @@ import {
   deriveHarnessSessionId,
   isBypassed,
 } from "../shared/session-model.mjs";
+import { createOvHttp } from "../shared/ov-http.mjs";
 import { isRetryableFailure as isSharedRetryableFailure } from "../shared/retryable.mjs";
 
 export { isBypassed };
@@ -34,46 +35,16 @@ export function deriveOvSessionId(kimiSessionId, suffix = "") {
   return deriveHarnessSessionId("kc-", kimiSessionId, suffix);
 }
 
-function responseTraceId(body) {
-  return body?.result?.trace_id || body?.error?.trace_id || body?.trace_id || undefined;
-}
-
 /**
  * Build a fetchJSON closure tied to a given config. `timeoutKey` selects the
  * per-hook timeout field (recall uses "timeoutMs", capture "captureTimeoutMs").
+ * Headers, timeouts and the result envelope are the shared ov-http stack's —
+ * the one place that writes OpenViking request headers.
  */
 export function makeFetchJSON(cfg, timeoutKey = "timeoutMs") {
-  const defaultTimeoutMs = Math.max(1000, cfg[timeoutKey] || cfg.timeoutMs || 10000);
-  return async function fetchJSON(path, init = {}, options = {}) {
-    const timeoutMs = Math.max(1000, Number(options.timeoutMs) || defaultTimeoutMs);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const headers = { "Content-Type": "application/json" };
-      if (cfg.apiKey) headers["Authorization"] = `Bearer ${cfg.apiKey}`;
-      if (cfg.account) headers["X-OpenViking-Account"] = cfg.account;
-      if (cfg.user) headers["X-OpenViking-User"] = cfg.user;
-      const actorPeerId = options.actorPeerId ?? "";
-      if (actorPeerId) headers["X-OpenViking-Actor-Peer"] = actorPeerId;
-      if (cfg.userAgent) headers["User-Agent"] = cfg.userAgent;
-      const res = await fetch(`${cfg.baseUrl}${path}`, { ...init, headers, signal: controller.signal });
-      const body = await res.json().catch(() => ({}));
-      const traceId = responseTraceId(body);
-      if (!res.ok || body.status === "error") {
-        return {
-          ok: false,
-          status: res.status,
-          error: body.error || { message: `HTTP ${res.status}` },
-          traceId,
-        };
-      }
-      return { ok: true, result: body.result ?? body, traceId };
-    } catch (err) {
-      return { ok: false, error: { message: err?.message || String(err) } };
-    } finally {
-      clearTimeout(timer);
-    }
-  };
+  return createOvHttp(cfg, {
+    defaultTimeoutMs: Math.max(1000, cfg[timeoutKey] || cfg.timeoutMs || 10000),
+  });
 }
 
 export function isRetryableFailure(res) {

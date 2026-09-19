@@ -49,7 +49,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { buildUserAgent, readManifestVersion, resolveOpenVikingCredentials } from "./shared/credentials.mjs";
+import { buildUserAgent, readManifestVersion, resolveConnection } from "./shared/credentials.mjs";
 import { loadPluginSettings, normalizeRewriteMode } from "./shared/plugin-config.mjs";
 import { normalizeRecallTargetTypes } from "./shared/recall-core.mjs";
 
@@ -127,7 +127,7 @@ export function isPluginEnabled() {
  * Load the full plugin configuration.
  */
 export function loadConfig() {
-  const creds = resolveOpenVikingCredentials();
+  const creds = resolveConnection("kimi_code", { rootKeyFallback: true });
   const ovConf = tryLoadJsonFile("OPENVIKING_CONFIG_FILE", DEFAULT_OV_CONF_PATH);
   const ovFile = ovConf?.file || {};
   const server = ovFile.server || {};
