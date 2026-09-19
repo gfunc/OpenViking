@@ -59,6 +59,23 @@ test("context requests omit defaults owned by the server", () => {
   assert.equal(body.dedup_turns, 5);
 });
 
+test("context requests scope targets via context_type when recallTargetTypes is set", () => {
+  const fromArray = buildContextSearchBody({ recallTargetTypes: ["memory", "skill"] });
+  assert.deepEqual(fromArray.context_type, ["memory", "skill"]);
+
+  const fromCsv = buildContextSearchBody({ recallTargetTypes: "memory, resource" });
+  assert.deepEqual(fromCsv.context_type, ["memory", "resource"]);
+
+  const unset = buildContextSearchBody({ recallTargetTypes: "" });
+  assert.equal(unset.context_type, undefined);
+
+  const unsetArray = buildContextSearchBody({});
+  assert.equal(unsetArray.context_type, undefined);
+
+  const invalid = buildContextSearchBody({ recallTargetTypes: ["bogus"] });
+  assert.equal(invalid.context_type, undefined);
+});
+
 test("coding-agent fallback recall explicitly uses the 0.35 threshold", () => {
   const body = buildRecallEndpointBody({});
 

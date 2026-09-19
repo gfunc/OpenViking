@@ -106,6 +106,19 @@ export function buildRecallEndpointBody(cfg = {}) {
   return body;
 }
 
+const CONTEXT_TYPES = new Set(["memory", "resource", "skill"]);
+
+/**
+ * Normalize recallTargetTypes (array or CSV string) to server `context_type`
+ * values. Returns null when unset/empty so the request body omits the field
+ * and the server keeps its default quotas-driven targeting.
+ */
+export function normalizeRecallTargetTypes(value) {
+  const raw = Array.isArray(value) ? value : String(value || "").split(",");
+  const out = raw.map((t) => String(t).trim().toLowerCase()).filter((t) => CONTEXT_TYPES.has(t));
+  return out.length ? [...new Set(out)] : null;
+}
+
 /**
  * Body for the server-side context face. The plugin declares intent (coding
  * purpose, budget, session) and leaves the mechanics — quota ratios, tier
@@ -129,6 +142,8 @@ export function buildContextSearchBody(cfg = {}, options = {}) {
   if (limitConfigured) body.quotas = codingQuotas(limit);
   if (maxTokensConfigured) body.max_tokens = maxTokens;
   if (cfg.recallPeerScope === "actor") body.peer_scope = "actor";
+  const contextType = normalizeRecallTargetTypes(cfg.recallTargetTypes);
+  if (contextType) body.context_type = contextType;
 
   const sessionId = String(options.sessionId || "").trim();
   if (sessionId) {

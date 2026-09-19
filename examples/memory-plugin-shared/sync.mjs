@@ -44,6 +44,11 @@ export const TARGETS = [
     committed: false,
   },
   {
+    root: join(ROOT, "examples", "kimi-code-memory-plugin"),
+    dir: join(ROOT, "examples", "kimi-code-memory-plugin", "scripts", "shared"),
+    committed: false,
+  },
+  {
     root: join(ROOT, "examples", "dsh-memory-plugin"),
     dir: join(ROOT, "examples", "dsh-memory-plugin", "shared"),
     committed: false,

@@ -1,0 +1,59 @@
+{
+  "_doc": [
+    "Kimi Code hook entries for the OpenViking memory plugin.",
+    "Each element of `hooks` is merged into ~/.kimi-code/config.toml as a [[hooks]]",
+    "table by setup-helper/install.sh. Fields follow the Kimi Code hook schema:",
+    "event, matcher (optional regex), command, timeout (seconds, 1-600).",
+    "",
+    "__OV_KIMI_PLUGIN_DIR__ is a placeholder replaced by the installer with the",
+    "absolute plugin install directory (~/.openviking/kimi-code-memory-plugin).",
+    "",
+    "Timeouts: UserPromptSubmit 5s (recall must never stall the prompt), Stop 45s",
+    "(capture runs detached, this is only a fuse), SessionEnd 30s, PreCompact 30s",
+    "(synchronous commit before compaction), SubagentStop 45s, SubagentStart 10s,",
+    "SessionStart 10s (archive-overview prefetch is best-effort).",
+    "",
+    "Not wired on purpose: PostToolUse (observation-only, stdout is not injected,",
+    "so the claude-code plugin's skill-experience feature has no kimi equivalent)",
+    "and SessionHeartbeat (out of scope)."
+  ],
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "matcher": "startup|resume",
+      "command": "node __OV_KIMI_PLUGIN_DIR__/scripts/session-start.mjs",
+      "timeout": 10
+    },
+    {
+      "event": "UserPromptSubmit",
+      "command": "node __OV_KIMI_PLUGIN_DIR__/scripts/auto-recall.mjs",
+      "timeout": 5
+    },
+    {
+      "event": "Stop",
+      "command": "node __OV_KIMI_PLUGIN_DIR__/scripts/auto-capture.mjs",
+      "timeout": 45
+    },
+    {
+      "event": "PreCompact",
+      "matcher": "manual|auto",
+      "command": "node __OV_KIMI_PLUGIN_DIR__/scripts/pre-compact.mjs",
+      "timeout": 30
+    },
+    {
+      "event": "SessionEnd",
+      "command": "node __OV_KIMI_PLUGIN_DIR__/scripts/session-end.mjs",
+      "timeout": 30
+    },
+    {
+      "event": "SubagentStart",
+      "command": "node __OV_KIMI_PLUGIN_DIR__/scripts/subagent-start.mjs",
+      "timeout": 10
+    },
+    {
+      "event": "SubagentStop",
+      "command": "node __OV_KIMI_PLUGIN_DIR__/scripts/subagent-stop.mjs",
+      "timeout": 45
+    }
+  ]
+}
