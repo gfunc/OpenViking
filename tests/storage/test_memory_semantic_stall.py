@@ -54,9 +54,6 @@ def _build_data(msg: SemanticMsg) -> dict:
 @pytest.mark.parametrize("context_type", ["resource", "memory", "skill"])
 async def test_retry_cancellation_keeps_skill_wait_isolated(monkeypatch, context_type):
     processor = _processor()
-    processor._circuit_breaker = SimpleNamespace(
-        check=MagicMock(side_effect=CircuitBreakerOpen), retry_after=0
-    )
     entered, release = asyncio.Event(), asyncio.Event()
     written = []
 
@@ -71,6 +68,9 @@ async def test_retry_cancellation_keeps_skill_wait_isolated(monkeypatch, context
         lambda: SimpleNamespace(SEMANTIC="Semantic", get_queue=lambda _: queue),
     )
     msg = _make_msg(context_type=context_type, telemetry_id=str(uuid4()))
+    processor._circuit_breakers[msg.account_id] = SimpleNamespace(
+        check=MagicMock(side_effect=CircuitBreakerOpen), retry_after=0
+    )
     worker = asyncio.create_task(processor.on_dequeue(msg.to_dict()))
     try:
         await asyncio.wait_for(entered.wait(), 1)
@@ -167,14 +167,8 @@ async def test_memory_ls_error_returns_failed():
 
 
 @pytest.mark.asyncio
-async def test_memory_ls_transient_error_requeues():
-    """Transient errors during ls() re-enqueue the msg and increment requeue count.
-
-    A 500-class error wrapped by the processor's `raise RuntimeError(...) from e`
-    is classified as `transient`. The outer on_dequeue() path must call
-    _reenqueue_semantic_msg(), bump requeue_count, and return REQUEUED without
-    a terminal error.
-    """
+async def test_memory_ls_transient_error_returns_failed():
+    """Queue processing does not retry an error after the owning layer exhausts it."""
     processor = _processor()
 
     fake_fs = MagicMock()
@@ -183,8 +177,6 @@ async def test_memory_ls_transient_error_requeues():
 
     msg = _make_msg(telemetry_id="tel-1")
     data = _build_data(msg)
-
-    reenqueue_mock = AsyncMock()
 
     with (
         patch(
@@ -195,14 +187,14 @@ async def test_memory_ls_transient_error_requeues():
             "openviking.storage.queuefs.semantic_work.resolve_telemetry",
             return_value=None,
         ),
-        patch.object(processor, "_reenqueue_semantic_msg", new=reenqueue_mock),
     ):
         result = await processor.on_dequeue(data)
 
-    assert result.outcome is ProcessOutcome.REQUEUED
+    assert result.outcome is ProcessOutcome.FAILED
     assert result.value is None
-    assert result.error is None
-    reenqueue_mock.assert_awaited_once()
+    assert result.error == (
+        f"Failed to list memory directory {msg.uri}: 500 Internal Server Error"
+    )
 
 
 @pytest.mark.asyncio

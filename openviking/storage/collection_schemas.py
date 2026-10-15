@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from openviking.core.context import ContextType, ResourceContentType
 from openviking.models.embedder.base import embed_compat
+from openviking.models.model_error import ModelErrorKind, model_error_kind
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.storage.acl import ACL_GRANT_FIELDS, ACL_MODE_FIELD, AclMode
@@ -43,16 +44,8 @@ from openviking.storage.viking_vector_index_backend import (
 )
 from openviking.telemetry import bind_telemetry, resolve_telemetry
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
-from openviking.utils.circuit_breaker import (
-    CircuitBreakerOpen,
-    classify_api_error,
-)
+from openviking.utils.circuit_breaker import CircuitBreakerOpen
 from openviking.utils.log_correlation import log_correlation
-from openviking.utils.model_retry import (
-    ERROR_CLASS_AUTH,
-    ERROR_CLASS_INPUT_TOO_LARGE,
-    ERROR_CLASS_PERMANENT,
-)
 from openviking.utils.tags import merge_search_tags
 from openviking.utils.time_utils import get_current_timestamp
 from openviking_cli.session.user_id import UserIdentifier
@@ -782,32 +775,40 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             embedding_msg,
                             f"Failed to generate embedding: {embed_err}",
                         )
-                        error_class = classify_api_error(embed_err)
+                        kind = model_error_kind(embed_err)
                         try:
                             from openviking.metrics.datasources import EmbeddingEventDataSource
 
                             EmbeddingEventDataSource.record_error(
-                                error_code=str(error_class or "unknown"),
+                                error_code=kind.value if kind is not None else "unknown",
                                 account_id=embedding_msg.context_data.get("account_id"),
                             )
                         except Exception:
                             pass
 
-                        if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
+                        if kind is ModelErrorKind.INPUT_TOO_LARGE:
                             execute_status = "error"
                             self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
 
-                        if error_class == ERROR_CLASS_PERMANENT:
+                        if kind in {
+                            ModelErrorKind.MODEL_NOT_FOUND,
+                            ModelErrorKind.UNSUPPORTED,
+                            ModelErrorKind.INVALID_REQUEST,
+                            ModelErrorKind.CONTENT_SAFETY,
+                        }:
                             execute_status = "error"
                             self._log_embedding_error(logging.CRITICAL, error_msg, embedding_msg)
                             self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
 
-                        if error_class == ERROR_CLASS_AUTH:
+                        if kind in {
+                            ModelErrorKind.AUTHENTICATION_ERROR,
+                            ModelErrorKind.PERMISSION_DENIED,
+                        }:
                             execute_status = "error"
                             # Bad/expired credential: retrying cannot succeed. Fail
                             # terminally instead of re-enqueueing, which would cycle
@@ -820,34 +821,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                             request_failed_message = error_msg
                             return ProcessResult.failed(error_msg)
 
-                        # Transient or unknown — re-enqueue for retry
-                        self._log_embedding_error(logging.WARNING, error_msg, embedding_msg)
-                        execute_status = "requeued"
-                        if self._vikingdb.has_queue_manager:
-                            try:
-                                await self._reenqueue_embedding_msg(embedding_msg)
-                                self._merge_request_stats(
-                                    embedding_msg.telemetry_id,
-                                    requeue_count=1,
-                                )
-                                get_request_wait_tracker().record_embedding_requeue(
-                                    embedding_msg.telemetry_id
-                                )
-                                logger.info(
-                                    "Re-enqueued embedding message after transient error: %s",
-                                    self._embedding_delivery_log_context(embedding_msg),
-                                )
-                                return ProcessResult.requeued()
-                            except Exception as requeue_err:
-                                logger.error(
-                                    self._embedding_error_msg(
-                                        embedding_msg,
-                                        f"Failed to re-enqueue message: {requeue_err}",
-                                    )
-                                )
-
                         self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
                         execute_status = "error"
+                        self._log_embedding_error(logging.ERROR, error_msg, embedding_msg)
                         request_failed_message = error_msg
                         return ProcessResult.failed(error_msg)
 

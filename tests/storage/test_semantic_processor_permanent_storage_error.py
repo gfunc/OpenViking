@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from openviking.models.model_error import ModelError, ModelErrorKind
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
 from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
 from openviking.service.task_work_index import TaskWorkIndex
@@ -216,42 +217,33 @@ async def test_malformed_resources_do_not_pause_following_valid_work(semantic_en
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("error", "trips_breaker"),
-    [(TimeoutError("API timeout"), True), (LockAcquisitionError("tree is locked"), False)],
-)
-async def test_retryable_errors_keep_existing_behavior(
-    semantic_env, monkeypatch, error, trips_breaker
-):
+async def test_lock_error_requeues_without_consuming_failure_budget(semantic_env, monkeypatch):
     env = semantic_env
     sleep = AsyncMock()
     monkeypatch.setattr("openviking.storage.queuefs.semantic_processor.asyncio.sleep", sleep)
     msg = env.message()
     breaker = CircuitBreaker(failure_threshold=1)
     env.processor._circuit_breakers[msg.account_id] = breaker
-    env.dag.run.side_effect = error
+    env.dag.run.side_effect = LockAcquisitionError("tree is locked")
 
     result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
 
     assert result.outcome is ProcessOutcome.REQUEUED
     env.retry_queue.enqueue.assert_awaited_once()
-    assert env.retry_queue.enqueue.call_args.args[0].id == msg.id
+    requeued = env.retry_queue.enqueue.call_args.args[0]
+    assert requeued.id == msg.id
+    assert requeued.failure_requeue_count == 0
     assert not env.tracker.is_complete(msg.telemetry_id)
     assert env.tracker.build_queue_status(msg.telemetry_id)["Semantic"]["requeue_count"] == 1
-    if trips_breaker:
-        with pytest.raises(CircuitBreakerOpen):
-            breaker.check()
-        sleep.assert_awaited_once()
-    else:
-        breaker.check()
-        sleep.assert_not_awaited()
+    breaker.check()
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_permanent_api_error_still_opens_breaker(semantic_env):
+async def test_semantic_model_error_fails_without_requeue(semantic_env):
     env = semantic_env
     msg = env.message()
-    error = RuntimeError("400 invalid model parameter")
+    error = ModelError(ModelErrorKind.TRANSIENT_SERVICE_ERROR, "model request failed")
     env.dag.run.side_effect = error
 
     result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
@@ -260,8 +252,25 @@ async def test_permanent_api_error_still_opens_breaker(semantic_env):
     assert result.error == str(error)
     env.retry_queue.enqueue.assert_not_awaited()
     await _assert_request_failed(env, msg, error)
-    with pytest.raises(CircuitBreakerOpen):
-        env.processor._account_breaker(msg.account_id).check()
+    env.processor._account_breaker(msg.account_id).check()
+
+
+@pytest.mark.asyncio
+async def test_invalid_request_does_not_open_breaker(semantic_env):
+    env = semantic_env
+    msg = env.message()
+    error = ModelError(ModelErrorKind.INVALID_REQUEST, "400 invalid model parameter")
+    env.dag.run.side_effect = error
+
+    result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
+
+    assert result.outcome is ProcessOutcome.FAILED
+    assert result.error == str(error)
+    env.retry_queue.enqueue.assert_not_awaited()
+    await _assert_request_failed(env, msg, error)
+    breaker = env.processor._account_breaker(msg.account_id)
+    breaker.check()
+    assert breaker._failure_count == 0
 
 
 @pytest.mark.asyncio

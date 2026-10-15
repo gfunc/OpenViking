@@ -23,6 +23,7 @@ const activity = {
       shortcut: '⌘ N 新建会话',
     },
     chat: {
+      emptyReadDescription: '当前会话暂无消息。',
       historyLoadFailed: '会话记录加载失败：{{error}}',
       sendFailed: '消息发送失败：{{error}}',
       copy: '复制',
@@ -30,6 +31,7 @@ const activity = {
       placeholder: '输入消息...',
       emptyState: '选择或创建一个会话开始聊天。',
       thinking: '思考中...',
+      generating: '生成中',
       reasoning: '思考过程',
       iteration: '第 {{count}} 轮',
       toolCall: '工具调用',

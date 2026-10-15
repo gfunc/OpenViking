@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from openviking.core.namespace import classify_uri
+from openviking.models.model_error import ModelErrorKind, model_error_kind
 from openviking.observability.context import (
     bind_root_observability_context,
     reset_root_observability_context,
@@ -35,7 +36,6 @@ from openviking.parse.parsers.media.utils import (
 from openviking.prompts import render_prompt
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
 from openviking.server.identity import RequestContext, Role
-from openviking.service.task_processing_time import pause_task_processing
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import detach_task_context
 from openviking.storage.abstract_overview import (
@@ -65,13 +65,8 @@ from openviking.telemetry import (
 )
 from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.telemetry.span_models import create_root_span_attributes
-from openviking.utils.circuit_breaker import (
-    CircuitBreaker,
-    CircuitBreakerOpen,
-    classify_api_error,
-)
+from openviking.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 from openviking.utils.ingest_options import IngestOptions
-from openviking.utils.model_retry import ERROR_CLASS_INPUT_TOO_LARGE, ERROR_CLASS_PERMANENT
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.config import get_openviking_config
@@ -81,6 +76,18 @@ if TYPE_CHECKING:
     from openviking.config.vlm import VLMHandle, VLMResolver
 
 logger = get_logger(__name__)
+
+_PERMANENT_STORAGE_ERRORS = (
+    FileNotFoundError,
+    PermissionError,
+    IsADirectoryError,
+    NotADirectoryError,
+    AGFSNotADirectoryError,
+)
+
+
+def _is_permanent_storage_error(error: BaseException) -> bool:
+    return any(isinstance(item, _PERMANENT_STORAGE_ERRORS) for item in (error, error.__cause__))
 
 
 class RequestQueueStats:
@@ -281,8 +288,7 @@ class SemanticProcessor(DequeueHandlerBase):
         # Throttle to prevent re-enqueue storm during OPEN window
         wait = self._account_breaker(msg.account_id).retry_after
         if wait > 0:
-            with pause_task_processing():
-                await asyncio.sleep(wait)
+            await asyncio.sleep(wait)
 
         queue_manager = get_queue_manager()
         if queue_manager is not None:
@@ -542,7 +548,11 @@ class SemanticProcessor(DequeueHandlerBase):
                             get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
                         return ProcessResult.success()
 
-                    if self._vlm_resolver is None:
+                    if (
+                        not msg.wait_for_embeddings_only
+                        and not msg.wait_for_request_completion
+                        and self._vlm_resolver is None
+                    ):
                         raise RuntimeError(
                             "SemanticProcessor requires a VLM resolver for account-owned work"
                         )
@@ -551,10 +561,27 @@ class SemanticProcessor(DequeueHandlerBase):
                         return ProcessResult.success()
                     semantic_lock = work.scope
                     assert semantic_lock is not None
+                    if (
+                        msg.wait_for_request_completion
+                        and not get_request_wait_tracker().is_complete_except(
+                            msg.telemetry_id, msg.id
+                        )
+                    ):
+                        # Keep a single-worker semantic queue moving while this
+                        # coordinator retains the producer's lease.
+                        await asyncio.sleep(0.05)
+                        await work.reenqueue()
+                        execute_status = "requeued"
+                        return ProcessResult.requeued()
                     dag_stats = None
                     processing_succeeded = False
                     try:
-                        if msg.plan is not None:
+                        if msg.wait_for_embeddings_only or msg.wait_for_request_completion:
+                            # SemanticMessageWork drains embeddings for the single-write
+                            # coordinator; the batch coordinator reaches this point only
+                            # after every sibling root has settled.
+                            pass
+                        elif msg.plan is not None:
                             if msg.uri.rstrip("/") != msg.plan.root_uri:
                                 raise ValueError("semantic message URI must match plan root_uri")
                             if msg.context_type != msg.plan.context_type:
@@ -678,7 +705,12 @@ class SemanticProcessor(DequeueHandlerBase):
                                 incremental_update=is_incremental,
                                 target_uri=target_uri,
                                 recursive=msg.recursive,
-                                lock=semantic_lock.lock,
+                                lock=(
+                                    None
+                                    if msg.generation_trigger == "content_write"
+                                    and msg.lock_handoff is not None
+                                    else semantic_lock.lock
+                                ),
                                 is_code_repo=msg.is_code_repo,
                                 changes=changes,
                                 skip_vectorization=msg.skip_vectorization,
@@ -692,6 +724,8 @@ class SemanticProcessor(DequeueHandlerBase):
                                 file_md5s=msg.file_md5s,
                                 artifact_files=msg.artifact_files,
                                 file_abstracts=msg.file_abstracts,
+                                file_vector_actions=msg.file_vector_actions,
+                                file_ingest_options=msg.file_ingest_options,
                                 telemetry_id=msg.telemetry_id,
                             )
                             await executor.run(run_uri)
@@ -720,8 +754,14 @@ class SemanticProcessor(DequeueHandlerBase):
                     failure = work.failure_result(dag_stats)
                     if failure is not None:
                         return failure
-                    get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
-                    self._merge_request_stats(msg.telemetry_id, processed=1)
+                    is_request_coordinator = msg.wait_for_request_completion
+                    get_request_wait_tracker().mark_semantic_done(
+                        msg.telemetry_id,
+                        msg.id,
+                        processed_delta=0 if is_request_coordinator else 1,
+                    )
+                    if not is_request_coordinator:
+                        self._merge_request_stats(msg.telemetry_id, processed=1)
                     logger.info(f"Completed semantic generation for: {msg.uri}")
                     breaker.record_success()
                     await self._cleanup_local_artifact(msg)
@@ -743,15 +783,18 @@ class SemanticProcessor(DequeueHandlerBase):
                     exc_info=True,
                 )
                 if msg is not None and work is not None:
-                    return await self._requeue_semantic_msg_after_error(
+                    result = await self._requeue_semantic_msg_after_error(
                         msg,
                         e,
                         work=work,
                     )
+                    if result.error is not None:
+                        execute_status = "error"
+                    return result
                 return ProcessResult.failed(str(e))
 
-            error_class = classify_api_error(e)
-            if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
+            kind = model_error_kind(e)
+            if kind is ModelErrorKind.INPUT_TOO_LARGE:
                 execute_status = "error"
                 logger.error(
                     f"Input too large processing semantic message, dropping: {e}",
@@ -765,16 +808,18 @@ class SemanticProcessor(DequeueHandlerBase):
                 if msg is not None:
                     await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
-            elif error_class == ERROR_CLASS_PERMANENT:
+            elif _is_permanent_storage_error(e) or kind in {
+                ModelErrorKind.MODEL_NOT_FOUND,
+                ModelErrorKind.UNSUPPORTED,
+                ModelErrorKind.INVALID_REQUEST,
+                ModelErrorKind.CONTENT_SAFETY,
+            }:
                 execute_status = "error"
                 logger.critical(
                     f"Permanent error processing semantic message, dropping: {e}",
                     exc_info=True,
                 )
-                # A malformed filesystem target does not indicate an API outage.
-                if breaker is not None and not any(
-                    isinstance(exc, AGFSNotADirectoryError) for exc in (e, e.__cause__)
-                ):
+                if breaker is not None and kind is not None:
                     breaker.record_failure(e)
                 if msg is not None:
                     self._merge_request_stats(msg.telemetry_id, error_count=1)
@@ -785,20 +830,19 @@ class SemanticProcessor(DequeueHandlerBase):
                     await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
             else:
-                # Transient or unknown — re-enqueue for retry
-                execute_status = "requeued"
-                logger.warning(
-                    f"Transient API error processing semantic message, re-enqueueing: {e}",
+                execute_status = "error"
+                if breaker is not None and kind is not None:
+                    breaker.record_failure(e)
+                logger.error(
+                    f"Error processing semantic message, not re-enqueueing: {e}",
                     exc_info=True,
                 )
-                if breaker is not None:
-                    breaker.record_failure(e)
-                if msg is not None and work is not None:
-                    return await self._requeue_semantic_msg_after_error(
-                        msg,
-                        e,
-                        work=work,
+                if msg is not None:
+                    self._merge_request_stats(msg.telemetry_id, error_count=1)
+                    get_request_wait_tracker().mark_semantic_failed(
+                        msg.telemetry_id, msg.id, str(e)
                     )
+                    await self._cleanup_local_artifact(msg)
                 return ProcessResult.failed(str(e))
         finally:
             if msg is not None and execute_started_at is not None:
