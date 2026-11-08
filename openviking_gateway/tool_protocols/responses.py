@@ -6,7 +6,7 @@ import copy
 import uuid
 
 from ..notices import without_recall_notice
-from ..protocols import text_content
+from ..protocols import string_type, text_content
 from .common import (
     PREFIX,
     SUMMARY_HEADROOM,
@@ -44,18 +44,18 @@ class ResponsesProtocol(ToolProtocol):
 
     @staticmethod
     def is_reply(message):
-        return message.get("role") == "assistant" or message.get("type") in {
+        return message.get("role") == "assistant" or string_type(message) in {
             "reasoning",
             *CLIENT_CALLS,
         }
 
     @staticmethod
     def accepts_context(message):
-        return message.get("role") == "user" or message.get("type") in TOOL_OUTPUTS
+        return message.get("role") == "user" or string_type(message) in TOOL_OUTPUTS
 
     @staticmethod
     def append_context(message, text):
-        if message.get("type") in TOOL_OUTPUTS:
+        if string_type(message) in TOOL_OUTPUTS:
             append_text(message, "output", text, "input_text", joins_strings=True)
         else:
             append_text(message, "content", text, "input_text")
@@ -150,7 +150,7 @@ class ResponsesProtocol(ToolProtocol):
 
     def public_response(self, value):
         value = {**value, "id": self.identifier}
-        if "tools" in value:
+        if isinstance(value.get("tools"), list):
             value["tools"] = [t for t in value["tools"] if not t.get("name", "").startswith(PREFIX)]
         return value
 
@@ -228,8 +228,12 @@ class ResponsesProtocol(ToolProtocol):
         if not self.completed or self.finish not in {"completed", "incomplete"}:
             raise ToolLoopError("Incomplete Responses event stream")
         if self.body.get("stream"):
-            # The terminal object is authoritative, including opaque reasoning
-            # data that need not appear in deltas. Never reconstruct signatures.
+            # Prefer terminal output for opaque fields; done events are complete
+            # items when a sparse terminal omits the entire output.
+            if not self.output and self.items:
+                indexes = set(self.items)
+                if indexes == set(range(len(indexes))) and self.closed == indexes:
+                    self.output = [self.items[index] for index in range(len(indexes))]
             if set(self.items) != set(range(len(self.output))) or self.closed != set(self.items):
                 raise ToolLoopError("Responses output items are missing")
             for index, item in enumerate(self.output):

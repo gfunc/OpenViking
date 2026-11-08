@@ -16,6 +16,7 @@ from openviking.models.model_error import (
     model_error_kind,
 )
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
+from openviking.storage.errors import InvalidPathLockRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,7 @@ _PERMANENT_IO_ERRORS = (
     IsADirectoryError,
     NotADirectoryError,
     AGFSNotADirectoryError,
+    InvalidPathLockRequestError,
 )
 
 TRANSIENT_API_ERROR_PATTERNS = (
@@ -182,6 +184,8 @@ TRANSIENT_API_ERROR_PATTERNS = (
     "ratelimit",
     "requestbursttoofast",
     "timeout",
+    # Ark / OpenAI SDK read timeouts say "Request timed out."
+    "timed out",
     "connectionerror",
     "connection refused",
     "connection reset",
@@ -295,6 +299,12 @@ def classify_api_error(error: Exception) -> str:
         for pattern in QUOTA_EXCEEDED_PATTERNS:
             if pattern in text_lower:
                 return ERROR_CLASS_QUOTA_EXCEEDED
+
+    # Bare timeouts often carry no message; asyncio.TimeoutError is a distinct
+    # class on Python 3.10.
+    for exc in (error, error.__cause__):
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return ERROR_CLASS_TRANSIENT
 
     for text in texts:
         text_lower = text.lower()

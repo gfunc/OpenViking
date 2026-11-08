@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import AsyncExitStack, aclosing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 
 from openviking.utils.media_limits import MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
+from openviking.utils.rule_delivery import MAX_RULE_RESULT_CHARS, bound_rule_text
 from vikingbot.agent.context import ContextBuilder
 from vikingbot.agent.memory import MemoryStore
 from vikingbot.agent.remote_skills import SkillRuntimeContext
@@ -33,6 +34,7 @@ from vikingbot.hooks import HookContext
 from vikingbot.hooks.manager import hook_manager
 from vikingbot.integrations.langfuse import LangfuseClient
 from vikingbot.observability.outcome import evaluate_response_outcome, should_update_outcome
+from vikingbot.openviking_mount.session_budget import session_budget
 from vikingbot.openviking_mount.session_state import (
     get_openviking_session_id,
     get_openviking_state,
@@ -59,7 +61,38 @@ def _is_tool_result_success(result: Any) -> bool:
 
 
 def _compact_msg_chars(messages: list[dict]) -> int:
-    return sum(len(json.dumps(m, ensure_ascii=False, default=str)) for m in messages)
+    """Count text and message structure; inline image bytes have a separate limit."""
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            budget_content = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}:
+                    image_url = part.get("image_url")
+                    url = image_url.get("url") if isinstance(image_url, dict) else image_url
+                    if isinstance(url, str) and _base64_data_url_bytes(url) > 0:
+                        bounded_url = url.split(",", 1)[0] + ",[inline media]"
+                        part = {
+                            **part,
+                            "image_url": (
+                                {**image_url, "url": bounded_url}
+                                if isinstance(image_url, dict)
+                                else bounded_url
+                            ),
+                        }
+                budget_content.append(part)
+            message = {**message, "content": budget_content}
+        total += len(json.dumps(message, ensure_ascii=False, default=str))
+    return total
+
+
+def _is_rule_result(message: dict) -> bool:
+    name = str(message.get("name", ""))
+    return message.get("role") == "tool" and (
+        name in {"rule_search", "openviking_rule_search", "viking_rule_search", "ov_rule_search"}
+        or (name.startswith("mcp_") and name.endswith("_rule_search"))
+    )
 
 
 def _base64_data_url_bytes(url: str) -> int:
@@ -264,6 +297,46 @@ class _PlainTextFinal:
     content: str | None = None
 
 
+@dataclass(slots=True)
+class _PreparedSteer:
+    """Preprocessed same-session input to merge into an active agent loop."""
+
+    msg: InboundMessage
+    prompt_messages: list[dict[str, Any]]
+    newly_recalled_exp_uris: list[str]
+    newly_recalled_exp_content: str
+    auto_memory_tool: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _AcceptedSteer:
+    """A steer accepted by the active turn and its in-flight preprocessing."""
+
+    msg: InboundMessage
+    task: asyncio.Task[_PreparedSteer]
+
+
+@dataclass(slots=True)
+class _AssistantBoundary:
+    """A plain-text reply emitted before later steer input continued the turn."""
+
+    content: str
+    reasoning_content: str | None = None
+
+
+@dataclass(slots=True)
+class _ActiveTurn:
+    """The single turn currently running in the serial AgentLoop."""
+
+    session_key: SessionKey
+    task: asyncio.Task
+    interruptible: bool = True
+    interrupted: bool = False
+    accepting_steer: bool = True
+    accepted_steers: list[_AcceptedSteer] = field(default_factory=list)
+    history_items: list[_PreparedSteer | _AssistantBoundary] = field(default_factory=list)
+
+
 class AgentIterationLimitExceeded(RuntimeError):
     """A structured task used every available AgentLoop iteration without submitting."""
 
@@ -317,7 +390,7 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         model: str | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         max_iterations: int = 50,
         memory_window: int = 50,
         brave_api_key: str | None = None,
@@ -339,7 +412,7 @@ class AgentLoop:
             provider: LLMProvider instance for making LLM calls.
             workspace: Path to the workspace directory for file operations.
             model: Optional model identifier. If not provided, uses the provider's default.
-            temperature: Sampling temperature for LLM requests (default: 0.7).
+            temperature: Sampling temperature; None uses the provider default.
             max_iterations: Maximum number of tool execution iterations per message (default: 50).
             memory_window: Maximum number of messages to keep in session memory (default: 50).
             brave_api_key: Optional API key for Brave search integration.
@@ -410,6 +483,8 @@ class AgentLoop:
         self._mcp_connected = False
         self._mcp_connecting = False
         self._ov_clients: dict[str, Any] = {}
+        self._active_turn: _ActiveTurn | None = None
+        self._queued_interrupt_counts: dict[SessionKey, int] = {}
         self._register_default_tools()
 
     async def _connect_mcp(self) -> None:
@@ -453,23 +528,26 @@ class AgentLoop:
         session_key: SessionKey,
         query: str,
         result: str,
+        *,
+        publish_events: bool = True,
     ) -> dict[str, Any]:
         """Expose automatic OpenViking memory lookup using the existing tool event stream."""
         args_str = json.dumps({"query": query}, ensure_ascii=False)
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                session_key=session_key,
-                content=f"auto_memory_search({args_str})",
-                event_type=OutboundEventType.TOOL_CALL,
+        if publish_events:
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    session_key=session_key,
+                    content=f"auto_memory_search({args_str})",
+                    event_type=OutboundEventType.TOOL_CALL,
+                )
             )
-        )
-        await self.bus.publish_outbound(
-            OutboundMessage(
-                session_key=session_key,
-                content=result,
-                event_type=OutboundEventType.TOOL_RESULT,
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    session_key=session_key,
+                    content=result,
+                    event_type=OutboundEventType.TOOL_RESULT,
+                )
             )
-        )
         return {
             "tool_name": "auto_memory_search",
             "args": args_str,
@@ -982,7 +1060,7 @@ class AgentLoop:
             return session.get_history(provider_name=provider_name)
 
         agents_config = getattr(self.config, "agents", None)
-        token_budget = int(getattr(agents_config, "session_context_token_budget", 12000) or 12000)
+        _, token_budget, _ = session_budget(agents_config)
         session_id = get_openviking_session_id(session)
         request_client = None
 
@@ -1016,10 +1094,20 @@ class AgentLoop:
                 provider_name=provider_name,
             )
             combined_history = ov_history + local_tail
-            trimmed_history = self._trim_history_to_token_budget(
-                combined_history,
-                token_budget,
+            summary_messages = (
+                ov_history[:1] if context_payload.get("latest_archive_overview") else []
             )
+            summary_tokens = sum(
+                self._history_message_tokens(message) for message in summary_messages
+            )
+            if summary_tokens >= token_budget:
+                summary_messages = []
+                summary_tokens = 0
+            trimmed_history = self._trim_history_to_token_budget(
+                combined_history[len(summary_messages) :],
+                token_budget - summary_tokens,
+            )
+            trimmed_history = summary_messages + trimmed_history
             if len(trimmed_history) != len(combined_history) or any(
                 before.get("content") != after.get("content")
                 for before, after in zip(
@@ -1125,14 +1213,13 @@ class AgentLoop:
 
         state = get_openviking_state(session)
         pending_tokens = int(state.get("last_pending_tokens", 0) or 0)
-        commit_token_threshold = int(getattr(agents_config, "commit_token_threshold", 6000) or 6000)
         incoming_tokens = cal_str_tokens(msg.content or "")
+        _, _, token_threshold = session_budget(agents_config)
         last_commit_local_index = parse_local_index(state.get("last_commit_local_index", -1))
         messages_since_commit = len(session.messages) - last_commit_local_index - 1
         incoming_messages_count = 1
         should_commit = bool(
-            pending_tokens >= commit_token_threshold
-            or pending_tokens + incoming_tokens >= commit_token_threshold
+            pending_tokens + incoming_tokens >= token_threshold
             or messages_since_commit + incoming_messages_count >= self.memory_window
         )
         if not should_commit:
@@ -1182,13 +1269,23 @@ class AgentLoop:
         while self._running:
             try:
                 # Wait for next message
-                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
+                msg = await self.bus.consume_inbound()
 
                 # Process it
                 try:
-                    response = await self._process_message(msg)
+                    queued_interrupts = self._queued_interrupt_counts.get(msg.session_key, 0)
+                    if queued_interrupts > 0:
+                        if queued_interrupts == 1:
+                            self._queued_interrupt_counts.pop(msg.session_key, None)
+                        else:
+                            self._queued_interrupt_counts[msg.session_key] = queued_interrupts - 1
+                        response = await self._complete_interrupted_message(msg)
+                    else:
+                        response = await self._process_message_as_active_turn(msg)
                     if response:
                         await self.bus.publish_outbound(response)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     logger.exception(f"Error processing message: {e}")
                     # Send error response
@@ -1202,10 +1299,261 @@ class AgentLoop:
             except asyncio.TimeoutError:
                 continue
 
+    async def interrupt(self, session_key: SessionKey) -> bool:
+        """Interrupt the active or already queued turn for a session."""
+        active = self._active_turn
+        if (
+            active
+            and active.session_key == session_key
+            and active.interruptible
+            and not active.task.done()
+        ):
+            pending_count = self.bus.count_pending_inbound_session(session_key)
+            if pending_count:
+                self._queued_interrupt_counts[session_key] = pending_count
+            active.interrupted = True
+            active.task.cancel()
+            return True
+        pending_count = self.bus.count_pending_inbound_session(session_key)
+        queued_interrupts = self._queued_interrupt_counts.get(session_key, 0)
+        if queued_interrupts < pending_count:
+            self._queued_interrupt_counts[session_key] = pending_count
+            return True
+        return False
+
+    def steer(self, msg: InboundMessage) -> bool:
+        """Attach same-session input directly to the active turn."""
+        active = self._active_turn
+        if (
+            active is None
+            or active.session_key != msg.session_key
+            or not active.accepting_steer
+            or active.interrupted
+            or active.task.done()
+            or not msg.need_reply
+            or msg.content.strip().startswith("/")
+        ):
+            return False
+        active.accepted_steers.append(
+            _AcceptedSteer(
+                msg=msg,
+                task=asyncio.create_task(self._prepare_steer_message(msg)),
+            )
+        )
+        return True
+
+    async def _process_message_as_active_turn(self, msg: InboundMessage) -> OutboundMessage | None:
+        active: _ActiveTurn
+
+        async def run_active_message() -> OutboundMessage | None:
+            return await self._process_message(msg, active_turn=active)
+
+        task = asyncio.create_task(run_active_message())
+        is_agent_turn = bool(
+            msg.need_reply
+            and msg.session_key.type != "system"
+            and self.config.mode != BotMode.DEBUG
+            and not msg.content.strip().startswith("/")
+        )
+        active = _ActiveTurn(
+            msg.session_key,
+            task,
+            interruptible=is_agent_turn,
+            accepting_steer=is_agent_turn,
+        )
+        self._active_turn = active
+        try:
+            response = await task
+            if active.accepted_steers:
+                raise RuntimeError("Active turn completed with unconsumed steer input")
+            return response
+        except asyncio.CancelledError:
+            if active.interrupted:
+                logger.info(f"Interrupted message from {msg.session_key}")
+                return await self._complete_interrupted_message(msg)
+            raise
+        except Exception:
+            if self._active_turn is active and (active.history_items or active.accepted_steers):
+                await self._complete_interrupted_message(msg)
+            raise
+        finally:
+            if self._active_turn is active:
+                # Clear the active pointer before cleanup so later interrupt calls
+                # cannot cancel this turn while its local teardown is finishing.
+                self._active_turn = None
+
+    async def _prepare_steer_message(self, msg: InboundMessage) -> _PreparedSteer:
+        try:
+            session_key = msg.session_key
+            session = self.sessions.get_or_create(
+                session_key,
+                skip_heartbeat=session_key.type == "cli",
+            )
+            ov_tools_enable = self._get_ov_tools_enable(session_key)
+            openviking_connection = (
+                msg.openviking_connection if isinstance(msg.openviking_connection, dict) else None
+            )
+            actor_peer_id = msg.actor_peer_id or msg.sender_id
+            memory_peer_ids = self._metadata_memory_peer_ids(msg.metadata)
+            memory_owner_user_ids = self._metadata_memory_owner_user_ids(msg.metadata)
+            channel_config = self._get_channel_config(session_key)
+            profile_user_list = []
+            if channel_config and ov_tools_enable:
+                profile_user_list = getattr(channel_config, "profile_user_list", [])
+                if not memory_peer_ids:
+                    memory_peer_ids = self._channel_memory_peer_ids(channel_config)
+                if not memory_owner_user_ids:
+                    memory_owner_user_ids = self._channel_memory_owner_user_ids(channel_config)
+
+            message_workspace = (
+                self.sandbox_manager.get_workspace_path(session_key)
+                if self.sandbox_manager
+                else self.workspace
+            )
+            message_context = ContextBuilder(
+                message_workspace,
+                sandbox_manager=self.sandbox_manager,
+                sender_id=msg.sender_id,
+                actor_peer_id=actor_peer_id,
+                sender_name=msg.sender_name,
+                is_group_chat=msg.metadata.get("chat_type") == "group",
+                eval=self._eval,
+                openviking_connection=openviking_connection,
+                enable_subagents=self._subagents_enabled(),
+                config=self.config,
+            )
+            exp_exclude_uris = session.metadata.get("recalled_exp_uris", [])
+            if not isinstance(exp_exclude_uris, list):
+                exp_exclude_uris = []
+            prepared_messages = await message_context.build_messages(
+                history=[],
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                session_key=msg.session_key,
+                ov_tools_enable=ov_tools_enable,
+                profile_user_list=profile_user_list,
+                memory_peer_ids=memory_peer_ids,
+                memory_owner_user_ids=memory_owner_user_ids,
+                exp_exclude_uris=exp_exclude_uris,
+                include_system=False,
+            )
+            auto_memory_tool = None
+            if ov_tools_enable and message_context.latest_relevant_memories:
+                auto_memory_tool = await self._publish_auto_memory_context(
+                    session_key=session_key,
+                    query=msg.content,
+                    result=message_context.latest_relevant_memories,
+                    publish_events=False,
+                )
+            return _PreparedSteer(
+                msg=msg,
+                prompt_messages=prepared_messages,
+                newly_recalled_exp_uris=list(message_context.latest_recalled_exp_uris),
+                newly_recalled_exp_content=message_context.latest_recalled_exp_content,
+                auto_memory_tool=auto_memory_tool,
+            )
+        except Exception:
+            logger.exception("Failed to prepare steer context; using raw input")
+        return _PreparedSteer(
+            msg=msg,
+            prompt_messages=[
+                {
+                    "role": "user",
+                    "content": self.context._build_user_content(msg.content, msg.media),
+                }
+            ],
+            newly_recalled_exp_uris=[],
+            newly_recalled_exp_content="",
+        )
+
+    async def _take_accepted_steers(
+        self,
+        active: _ActiveTurn | None,
+    ) -> list[_PreparedSteer]:
+        if active is None:
+            return []
+        prepared: list[_PreparedSteer] = []
+        prepared_count = 0
+        # Keep ownership on the active turn until every observed batch is ready,
+        # so interrupt can still persist all accepted raw inputs at any await.
+        while prepared_count < len(active.accepted_steers):
+            accepted = active.accepted_steers[prepared_count:]
+            batch = await asyncio.gather(*(steer.task for steer in accepted))
+            prepared.extend(batch)
+            prepared_count += len(accepted)
+        del active.accepted_steers[:prepared_count]
+        return prepared
+
+    @staticmethod
+    def _append_active_turn_history(
+        session: Session,
+        items: list[_PreparedSteer | _AssistantBoundary],
+    ) -> None:
+        for item in items:
+            if isinstance(item, _AssistantBoundary):
+                session.add_message(
+                    "assistant",
+                    item.content,
+                    reasoning_content=item.reasoning_content,
+                )
+            else:
+                if item.newly_recalled_exp_content:
+                    session.add_message(
+                        "user",
+                        "[Experience Reminder]\n"
+                        f"## Relevant Agent Experience\n{item.newly_recalled_exp_content}",
+                        exp_uris=item.newly_recalled_exp_uris,
+                        experience_reminder=True,
+                    )
+                if item.newly_recalled_exp_uris:
+                    recalled_uris = session.metadata.setdefault("recalled_exp_uris", [])
+                    for uri in item.newly_recalled_exp_uris:
+                        if uri not in recalled_uris:
+                            recalled_uris.append(uri)
+                session.add_message(
+                    "user",
+                    item.msg.content,
+                    sender_id=item.msg.sender_id,
+                )
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    async def _complete_interrupted_message(self, msg: InboundMessage) -> OutboundMessage:
+        session_key = msg.session_key
+        skip_heartbeat = session_key.type == "cli"
+        session = self.sessions.get_or_create(session_key, skip_heartbeat=skip_heartbeat)
+        session.add_message("user", msg.content, sender_id=msg.sender_id)
+        active = self._active_turn
+        accepted_steers: list[_AcceptedSteer] = []
+        if active is not None and active.session_key == session_key:
+            accepted_steers = active.accepted_steers
+            consumed = (
+                item.msg for item in active.history_items if isinstance(item, _PreparedSteer)
+            )
+            pending = (steer.msg for steer in accepted_steers)
+            for steer_msg in (*consumed, *pending):
+                session.add_message(
+                    "user",
+                    steer_msg.content,
+                    sender_id=steer_msg.sender_id,
+                )
+        await self.sessions.save(session)
+        for steer in accepted_steers:
+            steer.task.cancel()
+        await asyncio.gather(
+            *(steer.task for steer in accepted_steers),
+            return_exceptions=True,
+        )
+        accepted_steers.clear()
+        return OutboundMessage(
+            session_key=msg.session_key,
+            content="",
+            event_type=OutboundEventType.INTERRUPT,
+            metadata={**(msg.metadata or {}), "reason": "interrupted"},
+        )
 
     async def _compact_tool_loop(
         self,
@@ -1219,9 +1567,10 @@ class AgentLoop:
         Keeps system messages and the original task, folds older turns into a
         structured summary note (the previous note is reused verbatim, only the
         region since it is summarized), and retains the most recent complete turns.
-        Summaries remain complete; ``budget_chars`` limits retained recent turns,
-        with cuts only between turns. Fixed instructions, summaries and the newest
-        turn can exceed that budget. Summarization failure is handled best effort.
+        Retain the latest Rule lookup with complete blocks within its inline budget.
+        Expired lookups are explicitly marked missing rather than summarized as
+        constraints. Keep call/result pairing and the latest user correction.
+        Refuse an oversized context if fixed instructions alone prevent fitting.
         """
         budget = budget_chars or 240_000
 
@@ -1233,20 +1582,101 @@ class AgentLoop:
         rest = messages[i + 1 :] if task_msg is not None else messages[i:]
 
         blocks = _compact_split_into_blocks(rest)
-        if len(blocks) <= 3:
-            return messages
-        to_compact_blocks = blocks[:-3]
-        window_blocks = blocks[-3:]
-
-        flat = [m for block in to_compact_blocks for m in block]
+        # Never summarize Rule bodies into replacement constraints. The latest
+        # bounded lookup stays in its original call/result block.
+        mandatory_indices: set[int] = set()
+        note_indices: set[int] = set()
         previous_summary = ""
-        marker_idx: int | None = None
-        for idx, message in enumerate(flat):
+        latest_user_idx: int | None = None
+        rule_indices: list[int] = []
+        for idx, block in enumerate(blocks):
+            message = block[0]
             content = str(message.get("content") or "")
-            if content.strip().startswith("[Context compaction]"):
-                marker_idx = idx
-                previous_summary = _compact_strip_note_header(content)
-        to_summarize = flat[marker_idx + 1 :] if marker_idx is not None else flat
+            if message.get("role") == "user":
+                if content.strip().startswith("[Context compaction]"):
+                    note_indices.add(idx)
+                    previous_summary = _compact_strip_note_header(content)
+                    continue
+                latest_user_idx = idx
+            if any(_is_rule_result(message) for message in block):
+                rule_indices.append(idx)
+        expired_rules = set(rule_indices[:-1])
+        for idx in expired_rules:
+            # A Rule lookup may share its turn with writes or other useful work.
+            # Expire only its own call/result pair, leaving that progress available
+            # for retention or summarization in the original order.
+            block = blocks[idx]
+            expired_ids = {
+                message.get("tool_call_id") for message in block if _is_rule_result(message)
+            }
+            progress = []
+            for message in block:
+                if _is_rule_result(message):
+                    continue
+                if message.get("tool_calls"):
+                    calls = [
+                        call for call in message["tool_calls"] if call.get("id") not in expired_ids
+                    ]
+                    message = {**message}
+                    if calls:
+                        message["tool_calls"] = calls
+                    else:
+                        message.pop("tool_calls")
+                        if not message.get("content"):
+                            continue
+                progress.append(message)
+            blocks[idx] = progress
+        if rule_indices:
+            latest_rules = rule_indices[-1]
+            mandatory_indices.add(latest_rules)
+            # Account for JSON escaping (notably newline-heavy results) and for
+            # parallel tool results sharing a single lookup block.
+            rule_count = sum(_is_rule_result(message) for message in blocks[latest_rules])
+            rule_budget = min(MAX_RULE_RESULT_CHARS, max(80, budget // (4 * rule_count)))
+            blocks[latest_rules] = [
+                {
+                    **message,
+                    "content": await self._preview_tool_result(
+                        message["content"],
+                        session_key,
+                        preserve_complete=True,
+                        rule_budget=rule_budget,
+                    ),
+                }
+                if _is_rule_result(message) and isinstance(message.get("content"), str)
+                else message
+                for message in blocks[latest_rules]
+            ]
+        if len(blocks) <= 3 and not expired_rules:
+            bounded = [
+                *system_msgs,
+                *([task_msg] if task_msg is not None else []),
+                *(message for block in blocks for message in block),
+            ]
+            if _compact_msg_chars(bounded) <= budget:
+                return bounded
+        # Choose the tail before filtering Rules, so pinning an old Rule cannot
+        # reorder recent turns or silently push the latest user out of context.
+        turn_indices = [
+            idx
+            for idx, block in enumerate(blocks)
+            if block and idx not in note_indices and block[0].get("role") != "tool"
+        ]
+        if not turn_indices:
+            if _compact_msg_chars(messages) > budget:
+                raise ValueError("Context exceeds output budget: fixed instructions cannot fit.")
+            return messages
+        mandatory_indices.add(turn_indices[-1])
+        if latest_user_idx is not None:
+            mandatory_indices.add(latest_user_idx)
+        window_indices = turn_indices[-3:]
+        older_indices = set(turn_indices[:-3])
+        summary_indices = [
+            idx
+            for idx in turn_indices
+            if idx not in mandatory_indices and (idx in older_indices or idx in expired_rules)
+        ]
+        to_summarize = [message for idx in summary_indices for message in blocks[idx]]
 
         new_summary = ""
         if to_summarize:
@@ -1279,31 +1709,44 @@ class AgentLoop:
             except Exception as exc:
                 logger.warning("Tool-loop compaction summarization failed: {}", exc)
                 new_summary = ""
+            if not new_summary:
+                # Keep progress accompanying expired lookups if the summary cannot
+                # preserve it. The final budget check still prevents an oversized request.
+                mandatory_indices.update(idx for idx in summary_indices if idx in expired_rules)
 
         note_msg = {"role": "user", "content": _compact_build_note(previous_summary, new_summary)}
+        if expired_rules:
+            note_msg["content"] += (
+                "\n\n[Rule history] delivery.complete=false. Older Rule lookups expired; "
+                "refresh applicable Rules before acting on constraints absent from the latest lookup."
+            )
 
         fixed_chars = _compact_msg_chars(system_msgs) + _compact_msg_chars([note_msg])
+        fixed_chars += sum(_compact_msg_chars(blocks[idx]) for idx in mandatory_indices)
         if task_msg is not None:
             fixed_chars += _compact_msg_chars([task_msg])
         remaining = max(0, budget - fixed_chars)
-        keep_blocks: list[list[dict]] = []
-        kept_chars = 0
-        for block in reversed(window_blocks):
-            if block[0].get("role") == "tool":
+        keep_indices = set(mandatory_indices)
+        for idx in reversed(window_indices):
+            if idx in mandatory_indices:
                 continue
-            size = _compact_msg_chars(block)
-            if keep_blocks and kept_chars + size > remaining:
+            size = _compact_msg_chars(blocks[idx])
+            if size > remaining:
                 break
-            keep_blocks.append(block)
-            kept_chars += size
-        keep_blocks.reverse()
+            keep_indices.add(idx)
+            remaining -= size
 
         out: list[dict] = list(system_msgs)
         if task_msg is not None:
             out.append(task_msg)
         out.append(note_msg)
-        for block in keep_blocks:
-            out.extend(block)
+        for idx in sorted(keep_indices):
+            out.extend(blocks[idx])
+        if _compact_msg_chars(out) > budget:
+            raise ValueError(
+                "Context exceeds output budget after compaction; fixed instructions, "
+                "latest user input or newest tool turn must be reduced before requesting the model."
+            )
         return out
 
     async def _summarize_compact_chunk(
@@ -1397,13 +1840,21 @@ class AgentLoop:
                 logger.warning("Tool-loop compaction summary attempt {}/3 failed: {}", attempt, exc)
         return ""
 
-    async def _preview_tool_result(self, result: Any, session_key: SessionKey) -> Any:
-        """Save text exceeding 8,000 characters and return a bounded head/tail preview.
+    async def _preview_tool_result(
+        self,
+        result: Any,
+        session_key: SessionKey,
+        *,
+        preserve_complete: bool = False,
+        rule_budget: int = MAX_RULE_RESULT_CHARS,
+    ) -> Any:
+        """Save large text and return a bounded preview or complete Rule blocks.
 
         Non-text results pass through. Saving failures are explicit in the preview;
         original tool outcomes still determine success and stop conditions.
         """
-        if not isinstance(result, str) or len(result) <= 8_000:
+        limit = rule_budget if preserve_complete else 8_000
+        if not isinstance(result, str) or len(result) <= limit:
             return result
         path = f"{TOOL_RESULT_DIRECTORY}/{uuid.uuid4().hex}.txt"
         try:
@@ -1420,6 +1871,8 @@ class AgentLoop:
                 f"{type(exc).__name__}. Only this preview is available; "
                 "retrieve smaller sections from the original source if needed."
             )
+        if preserve_complete:
+            return bound_rule_text(result, rule_budget, notice)
         return f"{result[:4_000]}\n\n[Output truncated. {notice}]\n\n{result[-2_000:]}"
 
     async def _run_agent_loop(
@@ -1447,6 +1900,7 @@ class AgentLoop:
         status_note_provider: Any | None = None,
         should_stop: Callable[[], bool] | None = None,
         skill_runtime: Any | None = None,
+        active_turn: _ActiveTurn | None = None,
         agent_id: str = "main",
         max_iterations: int | None = None,
     ) -> tuple[str | None, str | None, list[dict], dict[str, int], int]:
@@ -1525,6 +1979,7 @@ class AgentLoop:
         compact_pending = False
         compact_threshold_chars = (context_compact_budget or 0) * 0.85
         compact_trigger_chars = compact_threshold_chars
+        steer_memory_events: list[_PreparedSteer] = []
 
         def accumulate_token_usage(response: Any) -> None:
             if not response.usage:
@@ -1540,11 +1995,21 @@ class AgentLoop:
                 break
             iteration += 1
 
-            if context_compact_budget is not None:
+            if active_turn is not None and iteration >= iteration_limit:
+                active_turn.accepting_steer = False
+            accepted_steers = await self._take_accepted_steers(active_turn)
+            for steer in accepted_steers:
+                messages.extend(steer.prompt_messages)
+            if accepted_steers:
+                active_turn.history_items.extend(accepted_steers)
+            steer_memory_events.extend(accepted_steers)
+
+            if context_compact_budget is not None or _compact_msg_chars(messages) > 240_000:
+                budget = context_compact_budget or 240_000
                 current_chars = _compact_msg_chars(messages)
-                if compact_pending or current_chars > context_compact_budget:
+                if compact_pending or current_chars > budget:
                     messages = await self._compact_tool_loop(
-                        messages, session_key, budget_chars=context_compact_budget
+                        messages, session_key, budget_chars=budget
                     )
                     compact_pending = False
                     # Fixed task content can exceed the save threshold; wait for new content.
@@ -1567,6 +2032,14 @@ class AgentLoop:
                         event_type=OutboundEventType.ITERATION,
                     )
                 )
+                for steer in steer_memory_events:
+                    if steer.auto_memory_tool:
+                        await self._publish_auto_memory_context(
+                            session_key=session_key,
+                            query=steer.msg.content,
+                            result=steer.auto_memory_tool["result"],
+                        )
+            steer_memory_events.clear()
 
             if status_note_provider is not None:
                 note = await status_note_provider(iteration)
@@ -1578,6 +2051,9 @@ class AgentLoop:
                 disabled_tools=disabled_tools,
                 skill_runtime=skill_runtime,
             )
+            budget = context_compact_budget or 240_000
+            if _compact_msg_chars(messages) > budget:
+                messages = await self._compact_tool_loop(messages, session_key, budget_chars=budget)
             visible_tool_names = {
                 str(definition.get("function", {}).get("name") or "")
                 for definition in tool_definitions
@@ -1805,7 +2281,11 @@ class AgentLoop:
                 for _idx, tool_call, outcome, tool_execute_duration in results:
                     result = outcome.result
                     result_text = str(result)
-                    model_result = await self._preview_tool_result(result, session_key)
+                    model_result = await self._preview_tool_result(
+                        result,
+                        session_key,
+                        preserve_complete=getattr(outcome, "preserve_complete_result", False),
+                    )
                     recorded_result = (
                         result_text if isinstance(result, MultimodalToolResult) else model_result
                     )
@@ -1837,10 +2317,10 @@ class AgentLoop:
                         )
                     if isinstance(result, MultimodalToolResult):
                         result_media_bytes = _inline_media_bytes([{"content": result.content}])
-                        if not self.provider.supports_tool_result_media(self.model):
+                        if not self.provider.should_inline_tool_result_media(self.model):
                             model_result = (
-                                f"{result_text}\n\nMedia content was omitted because the configured "
-                                "model provider does not support media in tool results."
+                                f"{result_text}\n\nMedia content was omitted by the configured "
+                                "tool-result media policy."
                             )
                         else:
                             overflow = (
@@ -1970,6 +2450,29 @@ class AgentLoop:
                         }
                     )
                     continue
+                final_steers = await self._take_accepted_steers(active_turn)
+                if final_steers:
+                    messages = self.context.add_assistant_message(
+                        messages,
+                        response.content,
+                        [],
+                        reasoning_content=response.reasoning_content,
+                    )
+                    active_turn.history_items.append(
+                        _AssistantBoundary(
+                            content=response.content or "",
+                            reasoning_content=response.reasoning_content,
+                        )
+                    )
+                    active_turn.history_items.extend(final_steers)
+                    for steer in final_steers:
+                        messages.extend(steer.prompt_messages)
+                    steer_memory_events.extend(final_steers)
+                    continue
+                if active_turn is not None:
+                    # No await separates this close from the empty queue check,
+                    # so a successful steer cannot slip past the final checkpoint.
+                    active_turn.accepting_steer = False
                 final_content = response.content
                 final_reasoning_content = response.reasoning_content
                 if routed:
@@ -1994,6 +2497,11 @@ class AgentLoop:
                         ),
                     }
                 )
+                budget = context_compact_budget or 240_000
+                if _compact_msg_chars(messages) > budget:
+                    messages = await self._compact_tool_loop(
+                        messages, session_key, budget_chars=budget
+                    )
                 (
                     response,
                     _streamed_content,
@@ -2105,7 +2613,11 @@ class AgentLoop:
         extract_session_id=lambda msg: msg.session_key.safe_name(),
         extract_user_id=lambda msg: msg.sender_id,
     )
-    async def _process_message(self, msg: InboundMessage) -> OutboundMessage | None:
+    async def _process_message(
+        self,
+        msg: InboundMessage,
+        active_turn: _ActiveTurn | None = None,
+    ) -> OutboundMessage | None:
         """
         Process a single inbound message.
 
@@ -2402,13 +2914,6 @@ class AgentLoop:
             # Track newly recalled experience URIs for deduplication
             newly_recalled_exp_uris = getattr(message_context, "latest_recalled_exp_uris", [])
             newly_recalled_exp_content = getattr(message_context, "latest_recalled_exp_content", "")
-            if newly_recalled_exp_uris:
-                existing_uris = set(exp_exclude_uris)
-                for uri in newly_recalled_exp_uris:
-                    if uri not in existing_uris:
-                        existing_uris.add(uri)
-                        exp_exclude_uris.append(uri)
-                session.metadata["recalled_exp_uris"] = exp_exclude_uris
 
             # Run agent loop within a stable response identity for tracing/tool spans.
             response_id = uuid.uuid4().hex
@@ -2434,10 +2939,15 @@ class AgentLoop:
                     channel_metadata=msg.metadata,
                     captured_turns=agent_turns,
                     skill_runtime=skill_runtime,
+                    active_turn=active_turn,
                 )
 
             if auto_memory_tool:
                 tools_used = [auto_memory_tool, *(tools_used or [])]
+            active_turn_history = list(active_turn.history_items) if active_turn is not None else []
+            for item in active_turn_history:
+                if isinstance(item, _PreparedSteer) and item.auto_memory_tool:
+                    tools_used.append(item.auto_memory_tool)
 
             # Log response preview
             preview = final_content[:300] + "..." if len(final_content) > 300 else final_content
@@ -2454,8 +2964,17 @@ class AgentLoop:
                 tools_used=tools_used,
             )
 
+            if active_turn is not None:
+                # Detach before persistence so a later interrupt cannot cancel final session writes.
+                self._active_turn = None
+
             is_heartbeat = bool(msg.metadata.get(HEARTBEAT_METADATA_KEY))
             if not (is_heartbeat and is_heartbeat_noop_response(final_content)):
+                if newly_recalled_exp_uris:
+                    recalled_uris = session.metadata.setdefault("recalled_exp_uris", [])
+                    for uri in newly_recalled_exp_uris:
+                        if uri not in recalled_uris:
+                            recalled_uris.append(uri)
                 # Write experience reminder into session history so it persists
                 # across turns and survives bot restarts (in JSONL).
                 if newly_recalled_exp_content:
@@ -2466,6 +2985,7 @@ class AgentLoop:
                         experience_reminder=True,
                     )
                 session.add_message("user", msg.content, sender_id=msg.sender_id)
+                self._append_active_turn_history(session, active_turn_history)
                 session.add_message(
                     "assistant",
                     final_content,

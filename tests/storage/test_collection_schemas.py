@@ -13,7 +13,7 @@ import pytest
 import requests
 
 from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
-from openviking.models.model_error import ModelError, ModelErrorKind
+from openviking.models.model_error import ModelError, ModelErrorKind, brief_for
 from openviking.server.identity import RequestContext, Role, UserIdentifier
 from openviking.service.resource_service import ResourceService
 from openviking.storage.collection_schemas import (
@@ -935,6 +935,15 @@ async def test_embedding_auth_error_fails_terminally_without_reenqueue(monkeypat
     assert vikingdb.enqueued == []  # terminal: not re-enqueued
     (await handler.breaker()).check()  # breaker not tripped (would raise if open)
 
+    # The failing resource carries a structured per-resource error: exact uri
+    # plus the actionable, kind-specific brief.
+    assert len(result.errors) == 1
+    detail = result.errors[0]
+    assert isinstance(detail, dict)
+    assert detail["uri"] == "viking://resources/sample"
+    assert detail["err_brief"] == brief_for(ModelErrorKind.AUTHENTICATION_ERROR.value)
+    assert detail["message"] == result.error
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_query", [True, False])
@@ -1259,11 +1268,7 @@ async def test_embedding_handler_preserves_parent_uri_for_backend_upsert_logic(m
 
     assert result.outcome is ProcessOutcome.SUCCESS
     assert result.error is None
-    assert result.value == {
-        **queue_data["payload"]["context_data"],
-        "id": vector_record_id("default", "viking://resources/sample", 2),
-        "vector": [0.1, 0.2],
-    }
+    assert result.value == {"vector_written": True}
     assert "data" in captured
     assert captured["data"]["parent_uri"] == "viking://resources"
 
@@ -1324,9 +1329,7 @@ async def test_embedding_handler_honors_existing_record_id_override(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_embedding_handler_generates_id_when_no_existing_override(monkeypatch):
-    from openviking.storage.vector_ids import vector_record_id
-
+async def test_embedding_handler_generates_id_and_reports_written_context(monkeypatch):
     captured = {}
 
     class _CapturingVikingDB:
@@ -1343,48 +1346,15 @@ async def test_embedding_handler_generates_id_when_no_existing_override(monkeypa
         lambda: _DummyConfig(embedder),
     )
     payload = _build_queue_payload_for_account("acct-new-id")
-
-    await TextEmbeddingHandler(_CapturingVikingDB()).on_dequeue(payload)
-
-    assert captured["data"]["id"] == vector_record_id("acct-new-id", "viking://resources/sample", 2)
-
-
-@pytest.mark.asyncio
-async def test_embedding_handler_settles_request_wait_by_message_id(monkeypatch):
-    class _CapturingVikingDB:
-        is_closing = False
-        mode = "local"
-        uses_content_field = False
-
-        async def upsert(self, _data, *, ctx, options=UpsertOptions()):
-            assert options.partial_update is False
-            return "rec-1"
-
-    embedder = _DummyEmbedder()
-    monkeypatch.setattr(
-        "openviking_cli.utils.config.get_openviking_config",
-        lambda: _DummyConfig(embedder),
-    )
-
-    completed = []
-    monkeypatch.setattr(
-        "openviking.storage.collection_schemas.get_request_wait_tracker",
-        lambda: SimpleNamespace(
-            mark_embedding_done=lambda telemetry_id, root_id, **kwargs: completed.append(
-                (telemetry_id, root_id, kwargs)
-            )
-        ),
-    )
-
-    handler = TextEmbeddingHandler(_CapturingVikingDB())
-    payload = _build_queue_payload()
     queue_data = json.loads(payload["data"])
-    queue_data["telemetry_id"] = "request-1"
+    queue_data["task_id"] = "task-1"
+    queue_data["_task_work_id"] = "work-1"
     payload["data"] = json.dumps(queue_data)
 
-    await handler.on_dequeue(payload)
+    result = await TextEmbeddingHandler(_CapturingVikingDB()).on_dequeue(payload)
 
-    assert completed == [("request-1", queue_data["id"], {"vector_written": True})]
+    assert captured["data"]["id"] == vector_record_id("acct-new-id", "viking://resources/sample", 2)
+    assert result.value == {"vector_written": True}
 
 
 def test_context_collection_uses_acl_mode_and_excludes_parent_uri():
@@ -1399,6 +1369,13 @@ def test_context_collection_uses_acl_mode_and_excludes_parent_uri():
         "DefaultValue": "none",
     }
     assert "acl_mode" in schema["ScalarIndex"]
+    for name in ("acl_direct_grants", "acl_inherited_grants"):
+        assert next(field for field in schema["Fields"] if field["FieldName"] == name) == {
+            "FieldName": name,
+            "FieldType": "list<string>",
+            "DefaultValue": ["none"],
+        }
+        assert name in schema["ScalarIndex"]
     assert "acl_enabled" not in field_names
     assert "acl_enabled" not in schema["ScalarIndex"]
     assert "parent_uri" not in field_names

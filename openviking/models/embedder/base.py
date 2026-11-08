@@ -392,16 +392,20 @@ class EmbedderBase(ABC):
         self,
         func: Callable[[], Awaitable[T]],
         *,
+        is_query: bool,
         logger=None,
         operation_name: str,
     ) -> T:
-        """Run one async provider request with concurrency and telemetry guards."""
-        semaphore = getattr(self, "_account_semaphore", None)
-        if semaphore is None:
-            semaphore = _get_async_embed_semaphore(self.max_concurrent)
-        wait_started = time.monotonic()
-        await semaphore.acquire()
-        wait_elapsed = time.monotonic() - wait_started
+        """Limit document embedding concurrency while letting retrieval queries through."""
+        semaphore = None
+        wait_elapsed = 0.0
+        if not is_query:
+            semaphore = getattr(self, "_account_semaphore", None)
+            if semaphore is None:
+                semaphore = _get_async_embed_semaphore(self.max_concurrent)
+            wait_started = time.monotonic()
+            await semaphore.acquire()
+            wait_elapsed = time.monotonic() - wait_started
         telemetry = get_current_telemetry()
         telemetry.set("embedding.async.max_concurrent", self.max_concurrent)
         telemetry.set("embedding.async.wait_ms", round(wait_elapsed * 1000, 3))
@@ -424,7 +428,8 @@ class EmbedderBase(ABC):
                     elapsed * 1000,
                 )
             self._active_call_started_at = previous_started_at
-            semaphore.release()
+            if semaphore is not None:
+                semaphore.release()
 
     @property
     def is_dense(self) -> bool:
@@ -479,6 +484,7 @@ class EmbedderBase(ABC):
         try:
             from openviking.metrics.datasources import EmbeddingEventDataSource
             from openviking.observability.context import get_root_observability_context
+            from openviking.telemetry import get_ingestion_source_type
 
             root_context = get_root_observability_context()
 
@@ -490,6 +496,7 @@ class EmbedderBase(ABC):
                 completion_tokens=int(completion_tokens),
                 account_id=getattr(self, "_account_id", None)
                 or (root_context.account_id if root_context is not None else None),
+                source_type=get_ingestion_source_type(),
             )
         except Exception as e:
             # Metrics must never break embedding execution.
@@ -656,28 +663,38 @@ class CompositeHybridEmbedder(HybridEmbedderBase):
 
     @property
     def supports_multimodal(self) -> bool:
-        """Supports multimodal input only if both sub-embedders do."""
-        return self.dense_embedder.supports_multimodal and self.sparse_embedder.supports_multimodal
+        """Images are handled by the dense channel; sparse consumes only text."""
+        return self.dense_embedder.supports_multimodal
+
+    def _sparse_input(self, content: "EmbeddingInput") -> Optional[str]:
+        text = extract_text_from_content(content)
+        if isinstance(content, list) and not text.strip():
+            return None
+        return self.sparse_embedder.prepare_embedding_input(text)
 
     def embed(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
         """Combine results from both embedders"""
         dense_input = self.dense_embedder.prepare_embedding_input(content)
-        sparse_input = self.sparse_embedder.prepare_embedding_input(content)
+        sparse_input = self._sparse_input(content)
         dense_res = self.dense_embedder.embed(dense_input, is_query=is_query)
-        sparse_res = self.sparse_embedder.embed(sparse_input, is_query=is_query)
+        sparse_res = (
+            self.sparse_embedder.embed(sparse_input, is_query=is_query)
+            if sparse_input is not None
+            else None
+        )
 
         return EmbedResult(
-            dense_vector=dense_res.dense_vector, sparse_vector=sparse_res.sparse_vector
+            dense_vector=dense_res.dense_vector,
+            sparse_vector=sparse_res.sparse_vector if sparse_res is not None else None,
         )
 
     async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
         dense_input = self.dense_embedder.prepare_embedding_input(content)
-        sparse_input = self.sparse_embedder.prepare_embedding_input(content)
-        calls = asyncio.gather(
-            self.dense_embedder.embed_async(dense_input, is_query=is_query),
-            self.sparse_embedder.embed_async(sparse_input, is_query=is_query),
-            return_exceptions=True,
-        )
+        sparse_input = self._sparse_input(content)
+        providers = [self.dense_embedder.embed_async(dense_input, is_query=is_query)]
+        if sparse_input is not None:
+            providers.append(self.sparse_embedder.embed_async(sparse_input, is_query=is_query))
+        calls = asyncio.gather(*providers, return_exceptions=True)
         # Keep the parent borrow alive until every child has stopped. Shielding
         # also lets cancellation wait for providers with asynchronous cleanup.
         from openviking.service.task_tracker_concurrency import run_to_completion
@@ -686,9 +703,11 @@ class CompositeHybridEmbedder(HybridEmbedderBase):
         for result in results:
             if isinstance(result, BaseException):
                 raise result
-        dense_res, sparse_res = results
+        dense_res = results[0]
+        sparse_res = results[1] if sparse_input is not None else None
         return EmbedResult(
-            dense_vector=dense_res.dense_vector, sparse_vector=sparse_res.sparse_vector
+            dense_vector=dense_res.dense_vector,
+            sparse_vector=sparse_res.sparse_vector if sparse_res is not None else None,
         )
 
     def get_dimension(self) -> int:

@@ -68,6 +68,36 @@ class VolcEngineVLM(OpenAIVLM):
         if not self.model:
             self.model = "doubao-seed-2-0-lite-260428"
 
+    def _create_chat_completion(self, client: Any, **kwargs: Any) -> Any:
+        """Leave sampling defaults to the service when no temperature is configured."""
+        if self.temperature is not None:
+            return client.chat.completions.create(**kwargs)
+        # The native SDK expands omitted optional arguments into JSON nulls.
+        # Its public transport keeps the already prepared request body unchanged.
+        from volcenginesdkarkruntime import AsyncArk
+        from volcenginesdkarkruntime._base_client import make_request_options
+        from volcenginesdkarkruntime._streaming import AsyncStream, Stream
+        from volcenginesdkarkruntime.types.chat import ChatCompletion, ChatCompletionChunk
+
+        body = dict(kwargs)
+        extra_headers = body.pop("extra_headers", None)
+        extra_body = body.pop("extra_body", None)
+        stream_options: Dict[str, Any] = {}
+        if kwargs.get("stream"):
+            stream_options = {
+                "stream": True,
+                "stream_cls": AsyncStream[ChatCompletionChunk]
+                if isinstance(client, AsyncArk)
+                else Stream[ChatCompletionChunk],
+            }
+        return client.post(
+            "/chat/completions",
+            body=body,
+            options=make_request_options(extra_headers=extra_headers, extra_body=extra_body),
+            cast_to=ChatCompletion,
+            **stream_options,
+        )
+
     def _parse_tool_calls(self, message) -> List[ToolCall]:
         """Parse tool calls from VolcEngine response message."""
         tool_calls = []
@@ -200,7 +230,7 @@ class VolcEngineVLM(OpenAIVLM):
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, VLMResponse]:
-        """Get text completion via Chat Completions API."""
+        """Get text completion; configured effort applies only when thinking is enabled."""
         effective_thinking = self.thinking if thinking is None else thinking
         kwargs_messages = sanitize_openai_messages(
             messages or [{"role": "user", "content": prompt}]
@@ -208,7 +238,7 @@ class VolcEngineVLM(OpenAIVLM):
         kwargs = {
             "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
-            "temperature": self.temperature,
+            **({"temperature": self.temperature} if self.temperature is not None else {}),
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
@@ -216,6 +246,8 @@ class VolcEngineVLM(OpenAIVLM):
             kwargs["extra_body"] = dict(self.extra_request_body)
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
+        if effective_thinking and self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -223,15 +255,18 @@ class VolcEngineVLM(OpenAIVLM):
         client = self.get_client()
         t0 = time.perf_counter()
         try:
-            response = client.chat.completions.create(**kwargs)
+            response = self._create_chat_completion(client, **kwargs)
         except Exception as error:
             self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
             raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
-        result = self._build_vlm_response(response, has_tools=bool(tools))
-        if tools:
+        if tools is not None:
+            result = self._build_vlm_response(response, has_tools=True)
+            if not tools:
+                result.content = self._clean_response(result.content or "")
             return result
+        result = self._build_vlm_response(response, has_tools=False)
         return self._clean_response(str(result))
 
     @model_error_boundary
@@ -245,8 +280,10 @@ class VolcEngineVLM(OpenAIVLM):
         max_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
     ) -> Union[str, VLMResponse]:
-        """Get text completion; per-call reasoning effort applies only with thinking enabled."""
+        """Get text completion; explicit effort overrides configured effort when thinking is enabled."""
         effective_thinking = self.thinking if thinking is None else thinking
+        if reasoning_effort is None:
+            reasoning_effort = self.reasoning_effort
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         kwargs_messages = sanitize_openai_messages(
             messages or [{"role": "user", "content": prompt}]
@@ -254,7 +291,7 @@ class VolcEngineVLM(OpenAIVLM):
         kwargs = {
             "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
-            "temperature": self.temperature,
+            **({"temperature": self.temperature} if self.temperature is not None else {}),
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
@@ -282,15 +319,18 @@ class VolcEngineVLM(OpenAIVLM):
         async def _call() -> Union[str, VLMResponse]:
             t0 = time.perf_counter()
             try:
-                response = await client.chat.completions.create(**kwargs)
+                response = await self._create_chat_completion(client, **kwargs)
             except Exception as error:
                 self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
                 raise
             elapsed = time.perf_counter() - t0
             self._update_token_usage_from_response(response, duration_seconds=elapsed)
-            result = self._build_vlm_response(response, has_tools=bool(tools))
-            if tools:
+            if tools is not None:
+                result = self._build_vlm_response(response, has_tools=True)
+                if not tools:
+                    result.content = self._clean_response(result.content or "")
                 return result
+            result = self._build_vlm_response(response, has_tools=False)
             content = self._clean_response(str(result))
             if content:
                 tracer.info(f"message.content={content}")
@@ -437,7 +477,7 @@ class VolcEngineVLM(OpenAIVLM):
         kwargs = {
             "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
-            "temperature": self.temperature,
+            **({"temperature": self.temperature} if self.temperature is not None else {}),
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
@@ -452,15 +492,18 @@ class VolcEngineVLM(OpenAIVLM):
         client = self.get_client()
         t0 = time.perf_counter()
         try:
-            response = client.chat.completions.create(**kwargs)
+            response = self._create_chat_completion(client, **kwargs)
         except Exception as error:
             self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
             raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
-        result = self._build_vlm_response(response, has_tools=bool(tools))
-        if tools:
+        if tools is not None:
+            result = self._build_vlm_response(response, has_tools=True)
+            if not tools:
+                result.content = self._clean_response(result.content or "")
             return result
+        result = self._build_vlm_response(response, has_tools=False)
         return self._clean_response(str(result))
 
     @model_error_boundary
@@ -488,7 +531,7 @@ class VolcEngineVLM(OpenAIVLM):
         kwargs = {
             "model": self.model or "doubao-seed-2-0-lite-260428",
             "messages": kwargs_messages,
-            "temperature": self.temperature,
+            **({"temperature": self.temperature} if self.temperature is not None else {}),
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
@@ -503,13 +546,16 @@ class VolcEngineVLM(OpenAIVLM):
         client = self.get_async_client()
         t0 = time.perf_counter()
         try:
-            response = await client.chat.completions.create(**kwargs)
+            response = await self._create_chat_completion(client, **kwargs)
         except Exception as error:
             self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
             raise
         elapsed = time.perf_counter() - t0
         self._update_token_usage_from_response(response, duration_seconds=elapsed)
-        result = self._build_vlm_response(response, has_tools=bool(tools))
-        if tools:
+        if tools is not None:
+            result = self._build_vlm_response(response, has_tools=True)
+            if not tools:
+                result.content = self._clean_response(result.content or "")
             return result
+        result = self._build_vlm_response(response, has_tools=False)
         return self._clean_response(str(result))
