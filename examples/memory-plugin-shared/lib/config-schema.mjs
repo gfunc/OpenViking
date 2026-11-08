@@ -95,6 +95,7 @@ export const KNOBS = [
   { name: "logRankingDetails", type: "bool", default: false, env: "OPENVIKING_LOG_RANKING_DETAILS", capability: "recall" },
   { name: "recallLedger", type: "bool", default: true, env: "OPENVIKING_RECALL_LEDGER", capability: "recall" },
   { name: "recallQueryFilters", type: "list", default: [], env: "OPENVIKING_RECALL_QUERY_FILTERS", capability: "recall" },
+  { name: "recallTargetTypes", type: "list", default: [], env: "OPENVIKING_RECALL_TARGET_TYPES", capability: "recall" },
   // Subtree URIs the recall search must never return. Without this there is no
   // way to keep generated directory files (viking://user/<space>/skills,
   // viking://user/<space>/resources, viking://agent/skills) out of the hits:
